@@ -117,37 +117,39 @@ func (mc *mysqlConn) writePacket(data []byte) error {
 		// Write packet
 		if mc.writeTimeout > 0 {
 			if err := mc.netConn.SetWriteDeadline(time.Now().Add(mc.writeTimeout)); err != nil {
+				mc.cleanup()
+				mc.log(err)
 				return err
 			}
 		}
 
 		n, err := mc.netConn.Write(data[:4+size])
-		if err == nil && n == 4+size {
-			mc.sequence++
-			if size != maxPacketSize {
-				return nil
-			}
-			pktLen -= size
-			data = data[size:]
-			continue
-		}
-
-		// Handle error
-		if err == nil { // n != len(data)
-			mc.cleanup()
-			mc.log(ErrMalformPkt)
-		} else {
+		if err != nil {
 			if cerr := mc.canceled.Value(); cerr != nil {
 				return cerr
 			}
+			mc.cleanup()
 			if n == 0 && pktLen == len(data)-4 {
 				// only for the first loop iteration when nothing was written yet
+				mc.log(err)
 				return errBadConnNoWrite
+			} else {
+				return err
 			}
-			mc.cleanup()
-			mc.log(err)
 		}
-		return ErrInvalidConn
+		if n != 4+size {
+			// io.Writer(b) must return a non-nil error if it cannot write len(b) bytes.
+			// The io.ErrShortWrite error is used to indicate that this rule has not been followed.
+			mc.cleanup()
+			return io.ErrShortWrite
+		}
+
+		mc.sequence++
+		if size != maxPacketSize {
+			return nil
+		}
+		pktLen -= size
+		data = data[size:]
 	}
 }
 
@@ -522,32 +524,33 @@ func (mc *okHandler) readResultOK() error {
 }
 
 // Result Set Header Packet
-// http://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::Resultset
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response.html
 func (mc *okHandler) readResultSetHeaderPacket() (int, error) {
 	// handleOkPacket replaces both values; other cases leave the values unchanged.
 	mc.result.affectedRows = append(mc.result.affectedRows, 0)
 	mc.result.insertIds = append(mc.result.insertIds, 0)
 
 	data, err := mc.conn().readPacket()
-	if err == nil {
-		switch data[0] {
-
-		case iOK:
-			return 0, mc.handleOkPacket(data)
-
-		case iERR:
-			return 0, mc.conn().handleErrorPacket(data)
-
-		case iLocalInFile:
-			return 0, mc.handleInFileRequest(string(data[1:]))
-		}
-
-		// column count
-		num, _, _ := readLengthEncodedInteger(data)
-		// ignore remaining data in the packet. see #1478.
-		return int(num), nil
+	if err != nil {
+		return 0, err
 	}
-	return 0, err
+
+	switch data[0] {
+	case iOK:
+		return 0, mc.handleOkPacket(data)
+
+	case iERR:
+		return 0, mc.conn().handleErrorPacket(data)
+
+	case iLocalInFile:
+		return 0, mc.handleInFileRequest(string(data[1:]))
+	}
+
+	// column count
+	// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
+	num, _, _ := readLengthEncodedInteger(data)
+	// ignore remaining data in the packet. see #1478.
+	return int(num), nil
 }
 
 // Error Packet
